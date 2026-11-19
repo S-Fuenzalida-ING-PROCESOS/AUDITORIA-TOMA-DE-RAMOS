@@ -1,37 +1,36 @@
 /****************************************************
- * AUDITORÍA TOMA DE RAMOS - v2 (script único)
+ * AUDITORÍA TOMA DE RAMOS - v3 (script único)
  *
  * UNA SOLA ACCIÓN:  Menú "Auditoría" ▸ "Ejecutar auditoría completa"
  *
+ * REPORTES DE ENTRADA (formato original de Banner, sin modificar):
+ *   Importa cada archivo como hoja nueva (Archivo ▸ Importar ▸ Insertar
+ *   hojas nuevas). El script reconoce cada reporte por su título, ignora las
+ *   filas de título y, si hay varias hojas del mismo reporte, usa la más
+ *   reciente según "Información obtenida al ...".
+ *     - UG307 Ramos Inscritos por Periodo ... período a revisar (diario)
+ *     - UG307 del verano anterior (año-1 + 65) ... SOLO si el período
+ *       revisado termina en 10 (primer semestre)
+ *     - RA311 Cumplimiento de Malla Pregrado
+ *     - RA307 CAPP Adicional (opcional)
+ *     - UG201 Listado de NRC por Periodo (del mismo período revisado)
+ *     - UG101 Listado Alumnos Vigentes (opcional; fuente de CARRERA)
+ *   Tablas internas: CATALOGO PE2026, CATALOGO OLD, CATALOGO OLDER, ELECTIVOS.
+ *
+ * Período a revisar: CONFIG_GENERAL ▸ PERIODO_REVISION (vacío = el período
+ * más reciente no-verano presente en los UG307).
+ *
  * Qué hace en una ejecución:
  *   1. Crea (si faltan) las hojas de configuración con valores por defecto.
- *   2. Determina el plan de estudios de cada alumno según CONFIG_PLANES
- *      (CARRERA + rango de CATALOGO -> PLAN_ID -> hoja de catálogo).
- *   3. Valida cada inscripción de RAMOS INSCRITOS:
- *        - código correcto para su plan / pertenencia a su major,
- *        - requisitos (aprobados en CUMPLIMIENTO MALLA, CAPP ADICIONAL
- *          y equivalencias por título / hoja EQUIVALENCIAS),
- *        - SCT aprobados (contando una sola vez cada curso cursado),
- *        - electivos (hoja ELECTIVOS).
- *      Lo que antes era Paso 2 (CAPP adicional / OLDER) se aplica ANTES de
- *      decidir si un caso se reporta. Lo que era Paso 3 (NRC correctos)
- *      se calcula en la misma pasada.
- *   4. Omite los cursos listados en EXCLUSIONES (formación general, otras
- *      facultades, ramo matrícula) y clasifica los códigos restantes.
- *   5. Seguimiento diario:
- *        - HISTORIAL_CASOS guarda cada caso (RUT + NRC + CÓDIGO), su primera
- *          y última detección, y su resolución.
- *        - Las columnas manuales de ALUMNOS_SIN_REQUISITOS (CAF/OBSERVACION,
- *          ESTADO y cualquier otra columna que agregues) se conservan.
- *        - CAMBIOS_DEL_DIA lista casos nuevos/resueltos y altas/bajas de
- *          inscripciones respecto del último día anterior ejecutado.
- *   6. Escribe RESUMEN, CONTROL_SCT y VALIDADOS_CAPP_ADICIONAL.
- *
- * Hojas de entrada (sin cambios de formato):
- *   CUMPLIMIENTO MALLA, RAMOS INSCRITOS, RAMOS INSCRITOS VERANO,
- *   CAPP ADICIONAL, ELECTIVOS, NRC POR PERIODO y las hojas de catálogo
- *   referenciadas en CONFIG_PLANES (hoy: CATALOGO PE2026 y CATALOGO OLD;
- *   CATALOGO OLDER se usa solo para equivalencias).
+ *   2. Determina el plan de estudios de cada alumno según CONFIG_PLANES.
+ *   3. Valida cada inscripción: código correcto para su plan, pertenencia a
+ *      su major, requisitos (RA311 + RA307 + equivalencias), SCT aprobados
+ *      (cada curso cursado cuenta una vez) y electivos.
+ *   4. Omite los cursos de EXCLUSIONES y clasifica los códigos restantes.
+ *   5. Seguimiento diario (HISTORIAL_CASOS, CAMBIOS_DEL_DIA) conservando las
+ *      columnas manuales de ALUMNOS_SIN_REQUISITOS.
+ *   6. Escribe RESUMEN (incluye período, verano y reportes usados),
+ *      NRC CORRECTOS, CONTROL_SCT y VALIDADOS_CAPP_ADICIONAL.
  ****************************************************/
 
 /* =========================
@@ -95,6 +94,7 @@ DEFAULT_CFG[SH.CFG_PLANES] = [
 
 DEFAULT_CFG[SH.CFG_GENERAL] = [
   ['PARAMETRO', 'VALOR', 'DESCRIPCION'],
+  ['PERIODO_REVISION', '', 'Período de toma de ramos a revisar (ej. 202710). Vacío = se toma del reporte UG307. Si termina en 10 se exige el UG307 del verano anterior (año-1 + 65).'],
   ['CATEGORIA_SOLICITUDES', 'Toma de Ramos 2026-20', 'Categoría de Banner (Comunicación Alumno Facultad) citada en el mensaje al estudiante'],
   ['FECHA_LIMITE_SOLICITUDES', 'jueves 06 de agosto', 'Plazo para solicitudes por canal alternativo, tal como aparece en el mensaje'],
   ['HOJAS_SOLO_EQUIVALENCIA', 'CATALOGO OLDER', 'Catálogos usados solo para reconocer equivalencias por título (separados por coma)'],
@@ -247,7 +247,17 @@ function ensureConfigSheets_(ss) {
     sh.setFrozenRows(1);
     created.push(name);
   }
+  ensureGeneralParams_(ss);
   return created;
+}
+
+/** Agrega a CONFIG_GENERAL los parámetros nuevos que aún no existan. */
+function ensureGeneralParams_(ss) {
+  const sh = ss.getSheetByName(SH.CFG_GENERAL);
+  const data = sh.getDataRange().getValues();
+  const have = new Set(data.map(r => asText_(r[0]).trim().toUpperCase()));
+  const missing = DEFAULT_CFG[SH.CFG_GENERAL].slice(1).filter(r => !have.has(r[0]));
+  if (missing.length) sh.getRange(data.length + 1, 1, missing.length, 3).setValues(missing);
 }
 
 function readGeneralConfig_(ss) {
@@ -260,6 +270,7 @@ function readGeneralConfig_(ss) {
   const get = (k, def) => (map.has(k) && map.get(k) !== '') ? map.get(k) : def;
 
   return {
+    periodoRevision: get('PERIODO_REVISION', ''),
     categoriaSolicitudes: get('CATEGORIA_SOLICITUDES', 'Toma de Ramos'),
     fechaLimite: get('FECHA_LIMITE_SOLICITUDES', '(fecha por definir)'),
     hojasSoloEquivalencia: splitList_(get('HOJAS_SOLO_EQUIVALENCIA', '')),
@@ -372,6 +383,9 @@ function loadContext_(ss) {
   const plans = readPlansConfig_(ss);
   const excl = readExclusions_(ss);
 
+  // Reportes de Banner en su formato original (o formato antiguo, como respaldo)
+  const inputs = loadInputs_(ss, general);
+
   // Catálogos de los planes (uno por hoja, aunque varios planes la compartan)
   const catalogs = new Map();
   for (const p of plans) {
@@ -399,41 +413,53 @@ function loadContext_(ss) {
   const flex = buildFlexIndex_(flexTitles, planCatalogs);
 
   const electivos = buildElectivosIndex_(mustGetSheet_(ss, SH.ELECTIVOS));
-  const nrcIndex = buildNrcPorPeriodoIndex_(mustGetSheet_(ss, SH.NRC));
-  const cum = buildCumplimientoIndex_(mustGetSheet_(ss, SH.CUMPLIMIENTO));
+  const nrcIndex = buildNrcPorPeriodoIndex_(inputs.nrc, inputs.period);
+  const cum = buildCumplimientoIndex_(inputs.cumplimiento);
 
-  const shCapp = ss.getSheetByName(SH.CAPP_ADICIONAL);
-  const extraApproved = shCapp ? buildCappApprovedIndex_(shCapp) : new Map();
-  // CODIGO ALTERNATIVO (si la columna existe en CUMPLIMIENTO MALLA)
+  const extraApproved = inputs.capp ? buildCappApprovedIndex_(inputs.capp) : new Map();
+  // CODIGO ALTERNATIVO (si la columna existe en el cumplimiento de malla)
   for (const [rut, codes] of cum.altApprovedByRut.entries()) {
     let m = extraApproved.get(rut);
     if (!m) { m = new Map(); extraApproved.set(rut, m); }
     for (const c of codes) if (!m.has(c)) m.set(c, 'CODIGO ALTERNATIVO');
   }
 
-  const ramos = readEnrollments_(mustGetSheet_(ss, SH.RAMOS));
-  const shVerano = ss.getSheetByName(SH.VERANO);
-  const verano = shVerano ? readEnrollments_(shVerano) : { rows: [], codesByRut: new Map(), nrcsByRut: new Map() };
+  // Carrera: UG101 (alumnos vigentes) si está disponible; si no, RA311.
+  const carreraByRut = new Map(cum.carreraByRut);
+  if (inputs.alumnos) {
+    const h = headerIndex_(inputs.alumnos[0]);
+    for (let i = 1; i < inputs.alumnos.length; i++) {
+      const rut = cleanRut_(inputs.alumnos[i][h.get('RUT')]);
+      const car = asText_(inputs.alumnos[i][h.get('CARRERA')]).trim();
+      if (rut && car) carreraByRut.set(rut, car);
+    }
+  }
+
+  const ramos = readEnrollments_(inputs.ramos);
+  const verano = inputs.verano
+    ? readEnrollments_(inputs.verano)
+    : { rows: [], codesByRut: new Map(), nrcsByRut: new Map() };
 
   return {
     now, todayKey, general, plans, excl,
     catalogs, planCatalogs, courseEquivalence, flex,
-    electivos, nrcIndex, cum, extraApproved,
-    ramos, verano
+    electivos, nrcIndex, cum, extraApproved, carreraByRut,
+    ramos, verano,
+    period: inputs.period,
+    summerPeriod: inputs.summerPeriod,
+    sources: inputs.sources,
+    inputAlerts: inputs.alerts
   };
 }
 
-function readEnrollments_(sheet) {
-  const data = sheet.getDataRange().getValues();
+/** data: tabla canónica [encabezado, ...filas] (ver normalizeRamos_). */
+function readEnrollments_(data) {
   const out = { rows: [], codesByRut: new Map(), nrcsByRut: new Map() };
-  if (data.length < 2) return out;
+  if (!data || data.length < 2) return out;
 
   const h = headerIndex_(data[0]);
-  const cRut = mustCol_(h, 'RUT');
-  const cCod = mustCol_(h, 'CODIGO');
-  const cCat = findColOneOf_(h, ['CATALOGO', 'PER. CATALOGO']);
-  const cTit = findColOneOf_(h, ['TITULO']);
-  const cNrc = findColOneOf_(h, ['NRC']);
+  const cRut = h.get('RUT'), cCod = h.get('CODIGO'), cCat = h.get('CATALOGO');
+  const cTit = h.get('TITULO'), cNrc = h.get('NRC');
 
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
@@ -444,9 +470,9 @@ function readEnrollments_(sheet) {
     const row = {
       rut,
       code,
-      catalog: cCat === null ? '' : cleanCatalog_(r[cCat]),
-      title: cTit === null ? '' : asText_(r[cTit]).trim(),
-      nrc: cNrc === null ? '' : cleanNrc_(r[cNrc])
+      catalog: cleanCatalog_(r[cCat]),
+      title: asText_(r[cTit]).trim(),
+      nrc: cleanNrc_(r[cNrc])
     };
     out.rows.push(row);
 
@@ -462,6 +488,315 @@ function readEnrollments_(sheet) {
 }
 
 /* =========================
+   REPORTES DE ENTRADA (formato original Banner)
+   - Se identifican por el código en el título (UG307, RA311, RA307,
+     UG201, UG101), sin importar el nombre de la hoja.
+   - El encabezado se busca automáticamente (las filas de título se ignoran).
+   - Si hay varias hojas del mismo reporte, se usa la de fecha
+     "Información obtenida al ..." más reciente.
+   - Si no hay reporte original, se usan las hojas con formato antiguo
+     (RAMOS INSCRITOS, CUMPLIMIENTO MALLA, etc.) como respaldo.
+========================= */
+const REPORTS = {
+  UG307: { label: 'UG307 - Ramos Inscritos por Periodo', key: ['RUT', 'NRC'], legacy: [SH.RAMOS, SH.VERANO] },
+  RA311: { label: 'RA311 - Cumplimiento de Malla', key: ['RUT', 'CREDITOS'], legacy: [SH.CUMPLIMIENTO] },
+  RA307: { label: 'RA307 - CAPP Adicional', key: ['RUT', 'NOTA'], legacy: [SH.CAPP_ADICIONAL] },
+  UG201: { label: 'UG201 - Listado de NRC por Periodo', key: ['NRC', 'PERIODO'], legacy: [SH.NRC] },
+  UG101: { label: 'UG101 - Listado Alumnos Vigentes', key: ['RUT', 'CARRERA'], legacy: [] }
+};
+
+function loadInputs_(ss, general) {
+  const alerts = [];
+  const sources = [];
+  const candidates = findReportSheets_(ss);
+
+  const pick = code => {
+    const list = candidates.filter(c => c.code === code).sort((a, b) => b.ts - a.ts);
+    if (list.length > 1) {
+      alerts.push(['REPORTE DUPLICADO', code,
+        `Se usa "${list[0].sheet.getName()}" (${list[0].tsText}); se ignoran: ${list.slice(1).map(x => `"${x.sheet.getName()}"`).join(', ')}.`]);
+    }
+    if (list.length) return list[0];
+    for (const name of REPORTS[code].legacy) {
+      const sh = ss.getSheetByName(name);
+      if (sh && sh.getLastRow() > 1) return { sheet: sh, code, ts: 0, tsText: 'formato antiguo', legacy: true };
+    }
+    return null;
+  };
+
+  const loadOne = (code, required, normalizer) => {
+    const src = pick(code);
+    if (!src) {
+      if (required) throw new Error(`Falta el reporte ${REPORTS[code].label}. Importa el archivo original como una hoja nueva.`);
+      sources.push([code, '(no disponible)', '', 0]);
+      return null;
+    }
+    const t = readReportTable_(src.sheet, REPORTS[code].key);
+    const data = normalizer(t);
+    sources.push([code, src.sheet.getName(), src.tsText, data.length - 1]);
+    return data;
+  };
+
+  /* --- UG307: inscripciones (período a revisar y, si corresponde, verano) --- */
+  const ug307 = candidates.filter(c => c.code === 'UG307');
+  if (!ug307.length) {
+    for (const name of REPORTS.UG307.legacy) {
+      const sh = ss.getSheetByName(name);
+      if (sh && sh.getLastRow() > 1) ug307.push({ sheet: sh, code: 'UG307', ts: 0, tsText: 'formato antiguo', legacy: true });
+    }
+  }
+  if (!ug307.length) throw new Error(`Falta el reporte ${REPORTS.UG307.label}.`);
+
+  // Para cada período presente, la hoja más reciente que lo contiene.
+  const byPeriod = new Map();   // período -> { src, rows }
+  for (const src of ug307) {
+    const data = normalizeRamos_(readReportTable_(src.sheet, REPORTS.UG307.key));
+    const parts = new Map();
+    for (let i = 1; i < data.length; i++) {
+      const p = cleanCatalog_(data[i][5]);
+      if (!parts.has(p)) parts.set(p, []);
+      parts.get(p).push(data[i]);
+    }
+    for (const [p, rows] of parts.entries()) {
+      const prev = byPeriod.get(p);
+      if (!prev || src.ts > prev.src.ts) byPeriod.set(p, { src, rows, header: data[0] });
+    }
+  }
+
+  let period = cleanCatalog_(general.periodoRevision);
+  if (!period) {
+    const regular = Array.from(byPeriod.keys()).filter(p => /^\d{6}$/.test(p) && !p.endsWith('65')).sort();
+    period = regular.length ? regular[regular.length - 1] : '';
+  }
+  if (!/^\d{6}$/.test(period)) {
+    throw new Error('No fue posible determinar el período a revisar. Indícalo en CONFIG_GENERAL (PERIODO_REVISION).');
+  }
+  const main = byPeriod.get(period);
+  if (!main) {
+    throw new Error(`No hay inscripciones del período ${period} en los reportes UG307 disponibles ` +
+      `(períodos encontrados: ${Array.from(byPeriod.keys()).join(', ') || 'ninguno'}).`);
+  }
+  const ramos = [main.header].concat(main.rows);
+  sources.push([`UG307 (${period})`, main.src.sheet.getName(), main.src.tsText, main.rows.length]);
+
+  // Verano: solo para la toma de ramos de primer semestre (período terminado en 10).
+  let verano = null;
+  let summerPeriod = '';
+  if (period.endsWith('10')) {
+    summerPeriod = `${Number(period.slice(0, 4)) - 1}65`;
+    const s = byPeriod.get(summerPeriod);
+    if (!s) {
+      throw new Error(`El período ${period} es de primer semestre y requiere el reporte UG307 del verano ${summerPeriod}. ` +
+        'Importa ese reporte como una hoja nueva y vuelve a ejecutar.');
+    }
+    verano = [s.header].concat(s.rows);
+    sources.push([`UG307 (${summerPeriod}, verano)`, s.src.sheet.getName(), s.src.tsText, s.rows.length]);
+  }
+
+  /* --- Resto de reportes --- */
+  const cumplimiento = loadOne('RA311', true, normalizeCumplimiento_);
+  const capp = loadOne('RA307', false, normalizeCapp_);
+  const nrc = loadOne('UG201', true, normalizeNrc_);
+  const alumnos = loadOne('UG101', false, normalizeAlumnos_);
+
+  // UG201 debe corresponder al período revisado.
+  const nrcPeriods = new Set();
+  for (let i = 1; i < nrc.length; i++) { const p = cleanCatalog_(nrc[i][5]); if (p) nrcPeriods.add(p); }
+  if (nrcPeriods.size && !nrcPeriods.has(period)) {
+    alerts.push(['UG201 DE OTRO PERIODO', Array.from(nrcPeriods).join(', '),
+      `El listado de NRC corresponde a ${Array.from(nrcPeriods).join(', ')} y se revisa ${period}: no se calculará NRC CORRECTO hasta importar el UG201 de ${period}.`]);
+  }
+
+  return { period, summerPeriod, ramos, verano, cumplimiento, capp, nrc, alumnos, sources, alerts };
+}
+
+/** Busca hojas cuyo título (primeras filas) contiene el código de un reporte. */
+function findReportSheets_(ss) {
+  const skip = new Set(Object.values(SH));
+  const out = [];
+  for (const sh of ss.getSheets()) {
+    const name = sh.getName();
+    if (skip.has(name)) continue;
+    const lastRow = sh.getLastRow();
+    const lastCol = sh.getLastColumn();
+    if (lastRow < 2 || lastCol < 1) continue;
+
+    const top = sh.getRange(1, 1, Math.min(10, lastRow), Math.min(5, lastCol)).getValues();
+    let code = '';
+    let tsText = '';
+    for (const row of top) {
+      for (const cell of row) {
+        const txt = asText_(cell);
+        const m = txt.match(/\b(UG307|RA311|RA307|UG201|UG101)\b/);
+        if (m && !code) {
+          code = m[1];
+          const t = txt.match(/(\d{2})\/(\d{2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+          if (t) tsText = t[0];
+        }
+      }
+    }
+    if (!code) continue;
+
+    let ts = 0;
+    const t = tsText.match(/(\d{2})\/(\d{2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (t) ts = new Date(+t[3], +t[2] - 1, +t[1], +t[4], +t[5], +(t[6] || 0)).getTime();
+    out.push({ sheet: sh, code, ts, tsText: tsText || '(sin fecha)', legacy: false });
+  }
+  return out;
+}
+
+/** Lee una hoja y ubica la fila de encabezado (la primera que contiene todas las columnas clave). */
+function readReportTable_(sheet, keyHeaders) {
+  const values = sheet.getDataRange().getValues();
+  const keys = keyHeaders.map(k => k.toUpperCase());
+  let hr = -1;
+  for (let i = 0; i < Math.min(30, values.length); i++) {
+    const set = new Set(values[i].map(x => asText_(x).trim().toUpperCase()));
+    if (keys.every(k => set.has(k))) { hr = i; break; }
+  }
+  if (hr < 0) throw new Error(`Hoja "${sheet.getName()}": no se encontró la fila de encabezado (${keyHeaders.join(', ')}).`);
+  return { name: sheet.getName(), header: values[hr].map(x => asText_(x).trim()), rows: values.slice(hr + 1) };
+}
+
+/* ---- Normalizadores: llevan cada reporte a columnas canónicas ---- */
+function colGetter_(t) {
+  const h = headerIndex_(t.header);
+  return {
+    has: (...names) => findColOneOf_(h, names) !== null,
+    idx: (...names) => findColOneOf_(h, names),
+    get: (row, ...names) => {
+      const i = findColOneOf_(h, names);
+      return i === null ? '' : row[i];
+    }
+  };
+}
+
+function codeFromMateriaCurso_(materia, curso) {
+  const m = asText_(materia).trim().toUpperCase();
+  let c = asText_(curso).trim().toUpperCase();
+  if (c.endsWith('.0')) c = c.slice(0, -2);
+  if (/^\d{1,3}$/.test(c)) c = c.padStart(4, '0');   // conserva ceros (ICI0230)
+  return m && c ? m + c : '';
+}
+
+function isRowEmpty_(row) {
+  return !row.some(v => asText_(v).trim() !== '');
+}
+
+/** UG307 -> RUT, CODIGO, CATALOGO, TITULO, NRC, PERIODO INSCRIPCION */
+function normalizeRamos_(t) {
+  const g = colGetter_(t);
+  const out = [['RUT', 'CODIGO', 'CATALOGO', 'TITULO', 'NRC', 'PERIODO INSCRIPCION']];
+  for (const r of t.rows) {
+    if (isRowEmpty_(r)) continue;
+    const code = g.has('CODIGO') ? g.get(r, 'CODIGO') : codeFromMateriaCurso_(g.get(r, 'MATERIA'), g.get(r, 'CURSO'));
+    out.push([
+      g.get(r, 'RUT'),
+      cleanCode_(code),
+      g.get(r, 'CATALOGO', 'PER. CATALOGO', 'PERIODO CATALOGO'),
+      g.get(r, 'TITULO', 'ASIGNATURA'),
+      g.get(r, 'NRC'),
+      cleanCatalog_(g.get(r, 'PERIODO INSCRIPCION'))
+    ]);
+  }
+  return out;
+}
+
+/**
+ * RA311 -> RUT, CODIGO, ESTADO CURSO, CREDITOS, CARRERA, PERIODO CURSADO,
+ *          NRC, TITULO ALTERNATIVO, CODIGO ALTERNATIVO
+ * Formato original: CODIGO = REGLA; ESTADO CURSO = APROBADO si la regla tiene
+ * un curso aplicado (período/NRC/nota/origen), DEBE si está vacía;
+ * TITULO = título del curso efectivamente cursado.
+ */
+function normalizeCumplimiento_(t) {
+  const g = colGetter_(t);
+  const original = g.has('DESCRIPCION REGLA');
+  const out = [['RUT', 'CODIGO', 'ESTADO CURSO', 'CREDITOS', 'CARRERA', 'PERIODO CURSADO', 'NRC', 'TITULO ALTERNATIVO', 'CODIGO ALTERNATIVO']];
+
+  for (const r of t.rows) {
+    if (isRowEmpty_(r)) continue;
+    const code = g.has('CODIGO') ? g.get(r, 'CODIGO') : g.get(r, 'REGLA');
+
+    let estado;
+    if (g.has('ESTADO CURSO')) {
+      estado = g.get(r, 'ESTADO CURSO');
+    } else {
+      const per = asText_(g.get(r, 'PERIODO CURSADO')).trim();
+      const nrc = asText_(g.get(r, 'NRC')).trim();
+      const nota = asText_(g.get(r, 'NOTA')).trim();
+      const origen = asText_(g.get(r, 'ORIGEN')).trim();
+      if (!per && !nrc && !nota && !origen) estado = 'DEBE';
+      else {
+        const n = toNumberStrict_(nota.replace(',', '.'));
+        estado = (!isNaN(n) && n < 4) ? 'REPROBADO' : 'APROBADO';
+      }
+    }
+
+    out.push([
+      g.get(r, 'RUT'),
+      cleanCode_(code),
+      asText_(estado).trim().toUpperCase(),
+      g.get(r, 'CREDITOS', 'CRÉDITOS', 'CREDITO', 'CRÉDITO'),
+      g.get(r, 'CARRERA', 'CARRERA BANNER 2026', 'CARRERA BANNER'),
+      g.get(r, 'PERIODO CURSADO'),
+      g.get(r, 'NRC'),
+      original ? g.get(r, 'TITULO') : g.get(r, 'TITULO ALTERNATIVO'),
+      g.get(r, 'CODIGO ALTERNATIVO', 'CÓDIGO ALTERNATIVO', 'CODIGO_ALTERNATIVO')
+    ]);
+  }
+  return out;
+}
+
+/** RA307 -> RUT, CODIGO, ESTADO CURSO (APROBADO si nota >= 4,0 o APR). */
+function normalizeCapp_(t) {
+  const g = colGetter_(t);
+  const out = [['RUT', 'CODIGO', 'ESTADO CURSO']];
+  for (const r of t.rows) {
+    if (isRowEmpty_(r)) continue;
+    const code = g.has('CODIGO') ? g.get(r, 'CODIGO') : codeFromMateriaCurso_(g.get(r, 'MATERIA'), g.get(r, 'CURSO'));
+    let estado = g.has('ESTADO CURSO') ? asText_(g.get(r, 'ESTADO CURSO')).trim().toUpperCase() : '';
+    if (!estado) {
+      const nota = asText_(g.get(r, 'NOTA')).trim().toUpperCase();
+      const n = toNumberStrict_(nota.replace(',', '.'));
+      estado = (nota === 'APR' || (!isNaN(n) && n >= 4)) ? 'APROBADO' : 'REPROBADO';
+    }
+    out.push([g.get(r, 'RUT'), cleanCode_(code), estado]);
+  }
+  return out;
+}
+
+/** UG201 -> NRC, CODIGO, LISTA CRUZADA, SECC., TIPO, PERIODO */
+function normalizeNrc_(t) {
+  const g = colGetter_(t);
+  const out = [['NRC', 'CODIGO', 'LISTA CRUZADA', 'SECC.', 'TIPO', 'PERIODO']];
+  for (const r of t.rows) {
+    if (isRowEmpty_(r)) continue;
+    const code = g.has('CODIGO') ? g.get(r, 'CODIGO') : codeFromMateriaCurso_(g.get(r, 'MATERIA'), g.get(r, 'CURSO'));
+    out.push([
+      g.get(r, 'NRC'),
+      cleanCode_(code),
+      g.get(r, 'LISTA CRUZADA', 'LC'),
+      g.get(r, 'SECC.', 'SECC', 'SECCION', 'SECCIÓN'),
+      g.get(r, 'TIPO', 'TIPO DE REUNION', 'TIPO DE REUNIÓN'),
+      cleanCatalog_(g.get(r, 'PERIODO'))
+    ]);
+  }
+  return out;
+}
+
+/** UG101 -> RUT, CARRERA, PERIODO CATALOGO */
+function normalizeAlumnos_(t) {
+  const g = colGetter_(t);
+  const out = [['RUT', 'CARRERA', 'PERIODO CATALOGO']];
+  for (const r of t.rows) {
+    if (isRowEmpty_(r)) continue;
+    out.push([g.get(r, 'RUT'), g.get(r, 'CARRERA'), g.get(r, 'PERIODO CATALOGO')]);
+  }
+  return out;
+}
+
+/* =========================
    ANÁLISIS PRINCIPAL
 ========================= */
 function analyze_(ctx) {
@@ -470,7 +805,7 @@ function analyze_(ctx) {
   const nrcRows = [];        // NRC CORRECTOS
   const cappValidated = [];  // VALIDADOS_CAPP_ADICIONAL
   const excludedCount = new Map();
-  const alerts = [];
+  const alerts = ctx.inputAlerts.slice();
   const alertedRuts = new Set();
   const seenCase = new Set();
 
@@ -479,7 +814,7 @@ function analyze_(ctx) {
   for (const en of ctx.ramos.rows) {
     const rut = en.rut;
     const code = en.code;
-    const carrera = (cum.carreraByRut.get(rut) || '').trim();
+    const carrera = (ctx.carreraByRut.get(rut) || '').trim();
 
     if (!cum.statusByRut.has(rut) && !alertedRuts.has(rut + '|CUM')) {
       alertedRuts.add(rut + '|CUM');
@@ -868,9 +1203,12 @@ function buildCodigoIncorrectoCumpleMsg_(expectedCode, planId, enrolledCode, equ
 ========================= */
 function findEquivalentNrc_(nrcIncorrecto, codigoEsperado, nrcIndex) {
   if (!nrcIncorrecto || !codigoEsperado) return { nrc: '', status: '', obs: 'Sin NRC o sin código esperado.' };
+  if (!nrcIndex.periodOk) {
+    return { nrc: '', status: 'SIN UG201 DEL PERIODO', obs: `Falta el listado de NRC (UG201) del período ${nrcIndex.period}.` };
+  }
 
   const infoInc = nrcIndex.byNrc.get(nrcIncorrecto);
-  if (!infoInc) return { nrc: '', status: 'NO ENCONTRADO', obs: `NRC no encontrado en "${SH.NRC}".` };
+  if (!infoInc) return { nrc: '', status: 'NO ENCONTRADO', obs: `NRC no encontrado en el listado de NRC (UG201) del período ${nrcIndex.period}.` };
 
   const lcNorm = normalizeNrcKey_(infoInc.lc);
   if (!lcNorm) return { nrc: '', status: 'LC VACIO', obs: 'LC/LISTA CRUZADA vacío: no es posible identificar el NRC equivalente.' };
@@ -896,11 +1234,11 @@ function nrcRow_(c, nrcInfo) {
   return [c.rut, c.titulo, c.nrc, nrcInfo.nrc || '', obs];
 }
 
-function buildNrcPorPeriodoIndex_(sheet) {
-  const data = sheet.getDataRange().getValues();
-  if (data.length < 2) throw new Error(`No hay datos en "${sheet.getName()}"`);
+function buildNrcPorPeriodoIndex_(data, period) {
+  if (!data || data.length < 2) throw new Error('El listado de NRC (UG201) no tiene datos.');
 
   const h = headerIndex_(data[0]);
+  const cPer = findColOneOf_(h, ['PERIODO']);
   const cNrc = mustColOneOf_(h, ['NRC']);
   const cCod = mustColOneOf_(h, ['CODIGO']);
   const cLc = mustColOneOf_(h, ['LC', 'LISTA CRUZADA']);
@@ -913,6 +1251,7 @@ function buildNrcPorPeriodoIndex_(sheet) {
     const nrc = cleanNrc_(row[cNrc]);
     const codigo = cleanCode_(row[cCod]);
     if (!nrc || !codigo) continue;
+    if (period && cPer !== null && cleanCatalog_(row[cPer]) && cleanCatalog_(row[cPer]) !== period) continue;
     const lc = asText_(row[cLc]).trim();
     const secc = cSecc === null ? '' : asText_(row[cSecc]).trim();
     const tipo = cTipo === null ? '' : normalizeNrcKey_(row[cTipo]);
@@ -933,7 +1272,7 @@ function buildNrcPorPeriodoIndex_(sheet) {
     if (!arr) { arr = []; byCodeLc.set(key, arr); }
     if (!arr.includes(rec.nrc)) arr.push(rec.nrc);
   }
-  return { byNrc, byCodeLc };
+  return { byNrc, byCodeLc, periodOk: byNrc.size > 0, period };
 }
 
 function scoreEquivalentNrc_(actual, cand) {
@@ -1284,9 +1623,8 @@ function normalizeCodesPick_(codes, parentCode) {
 /* =========================
    CUMPLIMIENTO / CAPP
 ========================= */
-function buildCumplimientoIndex_(sheet) {
-  const data = sheet.getDataRange().getValues();
-  if (data.length < 2) throw new Error(`No hay datos en "${sheet.getName()}"`);
+function buildCumplimientoIndex_(data) {
+  if (!data || data.length < 2) throw new Error('El cumplimiento de malla (RA311) no tiene datos.');
 
   const h = headerIndex_(data[0]);
   const cRut = mustCol_(h, 'RUT');
@@ -1360,10 +1698,9 @@ function buildCumplimientoIndex_(sheet) {
   return { statusByRut, carreraByRut, sctByRut, sctRawByRut, altApprovedByRut };
 }
 
-function buildCappApprovedIndex_(sheet) {
-  const data = sheet.getDataRange().getValues();
+function buildCappApprovedIndex_(data) {
   const out = new Map();
-  if (data.length < 2) return out;
+  if (!data || data.length < 2) return out;
 
   const h = headerIndex_(data[0]);
   const cRut = mustCol_(h, 'RUT');
@@ -1935,7 +2272,7 @@ function writeNrcCorrectosOutput_(ss, result) {
 
 function writeCambiosOutput_(ss, ctx, tracking) {
   const header = ['TIPO_CAMBIO', 'RUT', 'CARRERA', 'NRC', 'CODIGO', 'TITULO', 'DETALLE'];
-  const carr = rut => ctx.cum.carreraByRut.get(rut) || '';
+  const carr = rut => ctx.carreraByRut.get(rut) || '';
   const rows = [];
 
   for (const r of tracking.newTodayRecs) {
@@ -1967,7 +2304,7 @@ function writeSctControlOutput_(ss, ctx) {
   for (const [rut, raw] of ctx.cum.sctRawByRut.entries()) {
     const fixed = ctx.cum.sctByRut.get(rut) || 0;
     if (Math.abs(raw - fixed) > 1e-9) {
-      rows.push([rut, ctx.cum.carreraByRut.get(rut) || '', raw, fixed, raw - fixed]);
+      rows.push([rut, ctx.carreraByRut.get(rut) || '', raw, fixed, raw - fixed]);
     }
   }
   rows.sort((a, b) => b[4] - a[4]);
@@ -1985,6 +2322,15 @@ function writeResumenOutput_(ss, ctx, result, tracking, createdCfg, secs) {
   add('Inscripciones analizadas', ctx.ramos.rows.length);
   add('Alumnos inscritos', ctx.ramos.codesByRut.size);
   if (createdCfg.length) add('Hojas de configuración creadas', createdCfg.join(', '));
+  blank();
+
+  add('PERIODO Y FUENTES');
+  add('Período revisado', ctx.period);
+  add('Información de verano', ctx.summerPeriod
+    ? `Requerida (primer semestre): verano ${ctx.summerPeriod}, ${ctx.verano.rows.length} inscripciones`
+    : 'No aplica (el período no termina en 10)');
+  add('REPORTE', 'HOJA USADA', 'INFORMACIÓN OBTENIDA AL', 'FILAS');
+  for (const s of ctx.sources) add(...s);
   blank();
 
   add('SEGUIMIENTO');
@@ -2027,7 +2373,7 @@ function writeResumenOutput_(ss, ctx, result, tracking, createdCfg, secs) {
 
   add('ALERTAS');
   if (!result.alerts.length) add('(sin alertas)');
-  add('TIPO', 'RUT', 'DETALLE');
+  add('TIPO', 'RUT / DATO', 'DETALLE');
   for (const a of result.alerts) add(...a);
   blank();
 
