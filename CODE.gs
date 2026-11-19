@@ -15,7 +15,15 @@
  *     - RA307 CAPP Adicional (opcional)
  *     - UG201 Listado de NRC por Periodo (del mismo período revisado)
  *     - UG101 Listado Alumnos Vigentes (opcional; fuente de CARRERA)
- *   Tablas internas: CATALOGO PE2026, CATALOGO OLD, CATALOGO OLDER, ELECTIVOS.
+ *   Tablas internas: CATALOGO PE2027, CATALOGO PE2026, CATALOGO OLD,
+ *   CATALOGO OLDER, ELECTIVOS.
+ *
+ * Planes de estudio (CONFIG_PLANES):
+ *   - Catálogo >= 202710 ........ PE 2027 (hoja CATALOGO PE2027)
+ *   - Catálogo 202610 - 202709 .. PE 2026 (hoja CATALOGO PE2026)
+ *   - Catálogos anteriores ...... reglas por carrera (hoja CATALOGO OLD)
+ *   Si una hoja de catálogo no existe, la auditoría no se detiene: los
+ *   alumnos de ese plan se informan en ALERTAS y CODIGOS_NO_PRESENTES_EN_PLAN.
  *
  * Período a revisar: CONFIG_GENERAL ▸ PERIODO_REVISION (vacío = el período
  * más reciente no-verano presente en los UG307).
@@ -82,7 +90,8 @@ const DEFAULT_CFG = {};
 
 DEFAULT_CFG[SH.CFG_PLANES] = [
   ['CARRERA', 'CATALOGO_DESDE', 'CATALOGO_HASTA', 'PLAN_ID', 'FAMILIA', 'ETIQUETA_MENSAJE', 'HOJA_CATALOGO', 'PERMITE_CT', 'COMENTARIO'],
-  ['*',    202610, 999999, 'PE2026',      'PE2026', 'PE 2026',                   'CATALOGO PE2026', 'NO', 'Regla global: todo catálogo >= 202610'],
+  ['*',    202710, 999999, 'PE2027',      'PE2027', 'PE 2027',                   'CATALOGO PE2027', 'NO', 'Regla global: todo catálogo >= 202710'],
+  ['*',    202610, 202709, 'PE2026',      'PE2026', 'PE 2026',                   'CATALOGO PE2026', 'NO', 'Regla global: catálogo 202610 a 202709'],
   ['INGC', 202210, 202420, 'PE2022_ICC',  'OLD',    'PE 2022',                   'CATALOGO OLD',    'SI', ''],
   ['INGC', 202510, 202520, 'PE2025_ICC',  'OLD',    'PE 2025/2026',              'CATALOGO OLD',    'SI', ''],
   ['INGA', 202210, 202520, 'PE2022_ICA',  'OLD',    'PE 2022',                   'CATALOGO OLD',    'SI', ''],
@@ -248,7 +257,53 @@ function ensureConfigSheets_(ss) {
     created.push(name);
   }
   ensureGeneralParams_(ss);
-  return created;
+  const migrated = ensurePlanRows_(ss);
+  return created.concat(migrated);
+}
+
+/**
+ * Agrega a CONFIG_PLANES los planes globales nuevos (p. ej. PE2027) que aún
+ * no existan, y acota el rango de la regla global que hoy los cubre
+ * (PE2026 hasta 999999 -> hasta 202709). No toca reglas por carrera.
+ * Devuelve descripciones de los cambios para el RESUMEN.
+ */
+function ensurePlanRows_(ss) {
+  const sh = ss.getSheetByName(SH.CFG_PLANES);
+  const data = sh.getDataRange().getValues();
+  const h = headerIndex_(data[0]);
+  const cCar = h.get('CARRERA'), cDesde = h.get('CATALOGO_DESDE'), cHasta = h.get('CATALOGO_HASTA'), cId = h.get('PLAN_ID');
+  if ([cCar, cDesde, cHasta, cId].some(x => x === undefined)) return [];
+
+  const changes = [];
+  const haveIds = new Set(data.slice(1).map(r => asText_(r[cId]).trim().toUpperCase()));
+  const defaults = DEFAULT_CFG[SH.CFG_PLANES];
+  const dh = headerIndex_(defaults[0]);
+
+  for (const def of defaults.slice(1)) {
+    const id = asText_(def[dh.get('PLAN_ID')]).trim().toUpperCase();
+    if (def[dh.get('CARRERA')] !== '*' || haveIds.has(id)) continue;
+    const desde = Number(def[dh.get('CATALOGO_DESDE')]);
+
+    // Acotar reglas globales existentes que cubren el nuevo rango
+    for (let i = 1; i < data.length; i++) {
+      if (asText_(data[i][cCar]).trim() !== '*') continue;
+      const d = toNumberStrict_(data[i][cDesde]);
+      const hs = toNumberStrict_(data[i][cHasta]);
+      if ((isNaN(d) || d < desde) && (isNaN(hs) || hs >= desde)) {
+        sh.getRange(i + 1, cHasta + 1).setValue(desde - 1);
+        changes.push(`${SH.CFG_PLANES}: ${asText_(data[i][cId])} ahora llega hasta ${desde - 1}`);
+      }
+    }
+
+    // Nueva fila, respetando el orden de columnas de la hoja
+    const row = data[0].map(name => {
+      const j = dh.get(asText_(name).trim().toUpperCase());
+      return j === undefined ? '' : def[j];
+    });
+    sh.getRange(sh.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+    changes.push(`${SH.CFG_PLANES}: se agregó el plan ${def[dh.get('PLAN_ID')]}`);
+  }
+  return changes;
 }
 
 /** Agrega a CONFIG_GENERAL los parámetros nuevos que aún no existan. */
@@ -387,13 +442,23 @@ function loadContext_(ss) {
   const inputs = loadInputs_(ss, general);
 
   // Catálogos de los planes (uno por hoja, aunque varios planes la compartan)
+  // Si falta una hoja, no se detiene la auditoría: sus alumnos se informan aparte.
   const catalogs = new Map();
+  const missingCatalogs = new Map();   // hoja -> [PLAN_ID]
   for (const p of plans) {
-    if (!catalogs.has(p.hoja)) {
-      const sh = ss.getSheetByName(p.hoja);
-      if (!sh) throw new Error(`${SH.CFG_PLANES}: no existe la hoja de catálogo "${p.hoja}" (plan ${p.id}).`);
-      catalogs.set(p.hoja, buildCatalogIndex_(sh, p.hoja));
+    if (catalogs.has(p.hoja)) continue;
+    const sh = ss.getSheetByName(p.hoja);
+    if (!sh) {
+      if (!missingCatalogs.has(p.hoja)) missingCatalogs.set(p.hoja, []);
+      missingCatalogs.get(p.hoja).push(p.id);
+      continue;
     }
+    catalogs.set(p.hoja, buildCatalogIndex_(sh, p.hoja));
+  }
+  if (!catalogs.size) throw new Error(`${SH.CFG_PLANES}: no existe ninguna de las hojas de catálogo configuradas.`);
+  for (const [hoja, ids] of missingCatalogs.entries()) {
+    inputs.alerts.push(['CATALOGO NO CARGADO', hoja,
+      `No existe la hoja "${hoja}" (plan ${ids.join(', ')}). Los alumnos de ese plan no se validan hasta agregarla.`]);
   }
   const planCatalogs = Array.from(catalogs.values());
 
@@ -835,6 +900,11 @@ function analyze_(ctx) {
     }
 
     const planCatalog = catalogs.get(plan.hoja);
+    if (!planCatalog) {
+      if (exclCat) { incMap_(excludedCount, exclCat); continue; }
+      noPlan.push(noPlanRow_(en, carrera, plan.id, `Catálogo "${plan.hoja}" no cargado: no se validó la inscripción`));
+      continue;
+    }
     const otherCatalogs = planCatalogs.filter(c => c !== planCatalog);
 
     const student = {
@@ -1330,31 +1400,42 @@ function buildElectivosIndex_(sheet) {
   return { byCode };
 }
 
-/** PE puede ser BOTH, OLD, PE2026, un período (202610) o una lista de PLAN_ID. */
+/**
+ * PE puede ser BOTH, una familia (OLD, PE2026, PE2027...), un PLAN_ID o un
+ * período de catálogo (202610, 202710...). Los períodos se traducen a familia
+ * con las reglas globales "*" de CONFIG_PLANES (ver electivePeAllows_).
+ */
 function parsePeTokens_(v) {
   const out = new Set();
   for (const raw of splitList_(asText_(v))) {
     const s = raw.trim().toUpperCase();
     if (!s) continue;
-    const n = catalogNumber_(s);
-    if (!isNaN(n)) out.add(n >= 202610 ? 'PE2026' : 'OLD');
-    else if (s === 'AMBOS' || s === 'TODOS') out.add('BOTH');
+    if (s === 'AMBOS' || s === 'TODOS') out.add('BOTH');
     else out.add(s);
   }
   return out;
 }
 
+/** Familia de un período de catálogo según las reglas globales; si ninguna aplica, OLD. */
+function familyForCatalog_(plans, catalog) {
+  const p = resolvePlan_(plans, '', catalog);
+  return p && p.familia ? p.familia : 'OLD';
+}
+
 function electivePeAllows_(peSet, plan, plans) {
   if (!peSet || peSet.size === 0 || peSet.has('BOTH')) return true;
 
-  const known = new Set(['OLD', 'PE2026']);
+  const tokens = new Set();
+  for (const t of peSet) tokens.add(/^\d{6}$/.test(t) ? familyForCatalog_(plans, t) : t);
+
+  const known = new Set(['OLD']);
   for (const p of plans) { known.add(p.id.toUpperCase()); if (p.familia) known.add(p.familia); }
 
   let anyKnown = false;
-  for (const t of peSet) if (known.has(t)) anyKnown = true;
+  for (const t of tokens) if (known.has(t)) anyKnown = true;
   if (!anyKnown) return true;   // valor no reconocido: no se rechaza
 
-  return peSet.has(plan.id.toUpperCase()) || (plan.familia && peSet.has(plan.familia));
+  return tokens.has(plan.id.toUpperCase()) || (plan.familia && tokens.has(plan.familia));
 }
 
 function electiveEspecialidadAllows_(espSet, carrera) {
@@ -2321,7 +2402,7 @@ function writeResumenOutput_(ss, ctx, result, tracking, createdCfg, secs) {
   add('Duración (s)', secs);
   add('Inscripciones analizadas', ctx.ramos.rows.length);
   add('Alumnos inscritos', ctx.ramos.codesByRut.size);
-  if (createdCfg.length) add('Hojas de configuración creadas', createdCfg.join(', '));
+  if (createdCfg.length) add('Configuración creada / actualizada', createdCfg.join(' · '));
   blank();
 
   add('PERIODO Y FUENTES');
